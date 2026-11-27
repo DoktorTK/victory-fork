@@ -1553,15 +1553,42 @@ impl State {
             0 => None,
             h => crate::descriptor::heap(h as This).host(),
         }?;
-        let (mut addresses, mut constants) = (Vec::new(), Vec::new());
+        let mut addr_buf = [0u64; 64];
+        let mut addr_len = 0usize;
+        let mut addr_overflow = Vec::new();
+        let mut const_buf = [0u32; 64];
+        let mut const_len = 0usize;
+        let mut const_overflow = Vec::new();
         for root in self.roots_ref(compute) {
             match root {
-                Root::View(address) => addresses.push(*address),
-                Root::Constants(values) => constants.extend_from_slice(values),
+                Root::View(address) => {
+                    if addr_overflow.is_empty() && addr_len < addr_buf.len() {
+                        addr_buf[addr_len] = *address;
+                        addr_len += 1;
+                    } else {
+                        if addr_overflow.is_empty() {
+                            addr_overflow.extend_from_slice(&addr_buf[..addr_len]);
+                        }
+                        addr_overflow.push(*address);
+                    }
+                }
+                Root::Constants(values) => {
+                    if const_overflow.is_empty() && const_len + values.len() <= const_buf.len() {
+                        const_buf[const_len..const_len + values.len()].copy_from_slice(values);
+                        const_len += values.len();
+                    } else {
+                        if const_overflow.is_empty() {
+                            const_overflow.extend_from_slice(&const_buf[..const_len]);
+                        }
+                        const_overflow.extend_from_slice(values);
+                    }
+                }
                 _ => {}
             }
         }
-        crate::memory::ready(list, heap, &addresses, &constants, writes)
+        let addresses = if addr_overflow.is_empty() { &addr_buf[..addr_len] } else { &addr_overflow[..] };
+        let constants = if const_overflow.is_empty() { &const_buf[..const_len] } else { &const_overflow[..] };
+        crate::memory::ready(list, heap, addresses, constants, writes)
     }
 
     /// The bound heap holding `handle`.
@@ -1737,10 +1764,13 @@ impl State {
         // slots).
         let spans = if table_stages() { stage_spans(p) } else { Vec::new() };
         let mut staged: Vec<(u64, u32)> = Vec::new();
+        let mut made: Vec<(u8, u32)> = Vec::new();
+        let mut entries: Vec<&UsedResource> = Vec::new();
+        let mut selected: Vec<u32> = Vec::new();
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
-            let made = self.tables(list, &t.used, &t.host.root_indexed_views, &t.host.half_views, compute, &spans, &mut staged);
+            self.tables_into(list, &t.used, &t.host.root_indexed_views, &t.host.half_views, compute, &spans, &mut staged, &mut made, &mut entries, &mut selected);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -3881,6 +3911,7 @@ impl State {
     /// layout (`descriptor::host::half_view`): the title's own slot keeps
     /// the title's format for the shaders that read it as floats.
     #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn tables(
         &mut self,
         list: &HostList,
@@ -3891,6 +3922,28 @@ impl State {
         spans: &[(u8, u32, u32)],
         staged: &mut Vec<(u64, u32)>,
     ) -> Vec<(u8, u32)> {
+        let mut made = Vec::new();
+        let mut entries = Vec::new();
+        let mut selected = Vec::new();
+        self.tables_into(list, used, indexed, half, compute, spans, staged, &mut made, &mut entries, &mut selected);
+        made
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn tables_into<'a>(
+        &mut self,
+        list: &HostList,
+        used: &'a [UsedResource],
+        indexed: &[RootIndexedView],
+        half: &[(u8, u32)],
+        compute: bool,
+        spans: &[(u8, u32, u32)],
+        staged: &mut Vec<(u64, u32)>,
+        made: &mut Vec<(u8, u32)>,
+        entries: &mut Vec<&'a UsedResource>,
+        selected: &mut Vec<u32>,
+    ) {
+        made.clear();
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut fresh_mask: u64 = 0;
         let mut fresh_extra: Vec<u8> = Vec::new();
@@ -3966,12 +4019,9 @@ impl State {
             }
         }
         if fresh_mask == 0 && fresh_extra.is_empty() {
-            return Vec::new();
+            return;
         }
         fresh_extra.sort_unstable();
-        let mut made = Vec::new();
-        let mut entries: Vec<&UsedResource> = Vec::new();
-        let mut selected: Vec<u32> = Vec::new();
         let mut iter_mask = fresh_mask;
         let mut extra_idx = 0;
         while iter_mask != 0 || extra_idx < fresh_extra.len() {
@@ -4095,7 +4145,7 @@ impl State {
                         tally(18, 1);
                     }
                 }
-                for &k in &selected {
+                for &k in selected.iter() {
                     if entries.iter().any(|u| u.table_offset_dwords / 8 == k) {
                         continue;
                     }
@@ -4215,7 +4265,6 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         tally_done();
-        made
     }
 
     /// The first draws, at debug level: what they bind and read
